@@ -1,66 +1,65 @@
 const express = require("express");
-const Task = require("../models/Task");
-const User = require("../models/User");
-const Log = require("../models/Log");
-const authenticateToken = require("../middleware/auth");
 const router = express.Router();
+const Task = require("../models/Task");
+const Log = require("../models/Log");
+const User = require("../models/User");
+const authenticateToken = require("../middleware/auth");
 
-// Helper function to emit updated tasks to all clients
-const emitTaskUpdate = async (io) => {
+async function emitTaskUpdate(io) {
   try {
-    if (!io) {
-      console.warn("Socket.io instance is undefined, cannot emit taskUpdate");
-      return;
-    }
-    const tasks = await Task.find().populate("assignedUser", "email").lean();
-    const grouped = { Todo: [], "In Progress": [], Done: [] };
-    tasks.forEach((t) => {
-      if (grouped[t.status]) {
-        grouped[t.status].push(t);
-      } else {
-        console.warn(`Invalid task status: ${t.status}`);
-      }
-    });
-    console.log("Emitting taskUpdate:", grouped); // Debug
-    io.emit("taskUpdate", grouped);
+    const tasks = await Task.find()
+      .populate("assignedUser", "email")
+      .lean()
+      .exec();
+    console.log("MongoDB tasks queried:", tasks.length);
+    const groupedTasks = {
+      Todo: tasks.filter((t) => t.status === "Todo"),
+      "In Progress": tasks.filter((t) => t.status === "In Progress"),
+      Done: tasks.filter((t) => t.status === "Done"),
+    };
+    console.log("Emitting taskUpdate:", JSON.stringify(groupedTasks, null, 2));
+    io.emit("taskUpdate", groupedTasks);
   } catch (err) {
-    console.error("Error in emitTaskUpdate:", err.message);
+    console.error("Error emitting taskUpdate:", err.message);
   }
-};
+}
 
-// Get all tasks, grouped by status
 router.get("/", authenticateToken, async (req, res) => {
   try {
-    const tasks = await Task.find().populate("assignedUser", "email").lean();
-    const grouped = { Todo: [], "In Progress": [], Done: [] };
-    tasks.forEach((t) => {
-      if (grouped[t.status]) {
-        grouped[t.status].push(t);
-      }
-    });
-    res.json(grouped);
+    console.log("Fetching tasks for user:", req.user.email);
+    const tasks = await Task.find()
+      .populate("assignedUser", "email")
+      .lean()
+      .exec();
+    console.log("Tasks fetched:", tasks.length);
+    const groupedTasks = {
+      Todo: tasks.filter((t) => t.status === "Todo"),
+      "In Progress": tasks.filter((t) => t.status === "In Progress"),
+      Done: tasks.filter((t) => t.status === "Done"),
+    };
+    res.json(groupedTasks);
   } catch (err) {
     console.error("Error fetching tasks:", err.message);
     res.status(500).json({ error: "Error fetching tasks" });
   }
 });
 
-// Create a new task
 router.post("/", authenticateToken, async (req, res) => {
-  const { title, description, priority, status = "Todo" } = req.body;
-  if (!title || typeof title !== "string") {
-    return res
-      .status(400)
-      .json({ error: "Task title is required and must be a string" });
-  }
-  if (!["Todo", "In Progress", "Done"].includes(status)) {
-    return res.status(400).json({ error: "Invalid status" });
-  }
-  if (!["Low", "Medium", "High"].includes(priority)) {
-    return res.status(400).json({ error: "Invalid priority" });
-  }
+  const { title, description, priority, status } = req.body;
   try {
-    const task = new Task({ title, description, priority, status });
+    if (!title) return res.status(400).json({ error: "Title is required" });
+    if (status && !["Todo", "In Progress", "Done"].includes(status)) {
+      return res.status(400).json({ error: "Invalid status" });
+    }
+    if (priority && !["Low", "Medium", "High"].includes(priority)) {
+      return res.status(400).json({ error: "Invalid priority" });
+    }
+    const task = new Task({
+      title,
+      description,
+      priority,
+      status: status || "Todo",
+    });
     await task.save();
     const log = new Log({
       user: req.user.email,
@@ -68,19 +67,19 @@ router.post("/", authenticateToken, async (req, res) => {
     });
     await log.save();
     await emitTaskUpdate(req.io);
+    console.log("Emitting logUpdate:", log);
     req.io?.emit("logUpdate", log);
     res.status(201).json(task);
   } catch (err) {
     console.error("Error creating task:", err.message);
-    res.status(400).json({ error: err.message || "Error creating task" });
+    res.status(500).json({ error: "Error creating task" });
   }
 });
 
-// Update a task
 router.put("/:id", authenticateToken, async (req, res) => {
   const { lastFetched, ...updates } = req.body;
   try {
-    const task = await Task.findById(req.params.id);
+    const task = await Task.findById(req.params.id).exec();
     if (!task) return res.status(404).json({ error: "Task not found" });
     if (lastFetched && task.lastModified > new Date(lastFetched)) {
       return res
@@ -103,13 +102,16 @@ router.put("/:id", authenticateToken, async (req, res) => {
       req.params.id,
       { ...updates, lastModified: Date.now() },
       { new: true }
-    ).populate("assignedUser", "email");
+    )
+      .populate("assignedUser", "email")
+      .exec();
     const log = new Log({
       user: req.user.email,
       action: `Updated task: ${updatedTask.title}`,
     });
     await log.save();
     await emitTaskUpdate(req.io);
+    console.log("Emitting logUpdate:", log);
     req.io?.emit("logUpdate", log);
     res.json(updatedTask);
   } catch (err) {
@@ -118,17 +120,36 @@ router.put("/:id", authenticateToken, async (req, res) => {
   }
 });
 
-// Smart Assign: Assign task to user with fewest active tasks
+router.delete("/:id", authenticateToken, async (req, res) => {
+  try {
+    const task = await Task.findById(req.params.id).exec();
+    if (!task) return res.status(404).json({ error: "Task not found" });
+    await Task.deleteOne({ _id: req.params.id }).exec();
+    const log = new Log({
+      user: req.user.email,
+      action: `Deleted task: ${task.title}`,
+    });
+    await log.save();
+    await emitTaskUpdate(req.io);
+    console.log("Emitting logUpdate:", log);
+    req.io?.emit("logUpdate", log);
+    res.json({ message: "Task deleted" });
+  } catch (err) {
+    console.error("Error deleting task:", err.message);
+    res.status(500).json({ error: "Error deleting task" });
+  }
+});
+
 router.post("/:id/smart-assign", authenticateToken, async (req, res) => {
   try {
-    const users = await User.find().lean();
+    const users = await User.find().lean().exec();
     const taskCounts = await Promise.all(
       users.map(async (u) => ({
         user: u,
         count: await Task.countDocuments({
           assignedUser: u._id,
           status: { $ne: "Done" },
-        }),
+        }).exec(),
       }))
     );
     const leastBusyUser = taskCounts.reduce(
@@ -144,7 +165,9 @@ router.post("/:id/smart-assign", authenticateToken, async (req, res) => {
       req.params.id,
       { assignedUser: leastBusyUser._id, lastModified: Date.now() },
       { new: true }
-    ).populate("assignedUser", "email");
+    )
+      .populate("assignedUser", "email")
+      .exec();
     if (!task) return res.status(404).json({ error: "Task not found" });
     const log = new Log({
       user: req.user.email,
@@ -152,6 +175,7 @@ router.post("/:id/smart-assign", authenticateToken, async (req, res) => {
     });
     await log.save();
     await emitTaskUpdate(req.io);
+    console.log("Emitting logUpdate:", log);
     req.io?.emit("logUpdate", log);
     res.json(task);
   } catch (err) {
@@ -160,44 +184,7 @@ router.post("/:id/smart-assign", authenticateToken, async (req, res) => {
   }
 });
 
-// Delete a task
-router.delete("/:id", authenticateToken, async (req, res) => {
-  try {
-    const task = await Task.findByIdAndDelete(req.params.id);
-    if (!task) return res.status(404).json({ error: "Task not found" });
-    const log = new Log({
-      user: req.user.email,
-      action: `Deleted task: ${task.title}`,
-    });
-    await log.save();
-    await emitTaskUpdate(req.io);
-    req.io?.emit("logUpdate", log);
-    res.json({ message: "Task deleted" });
-  } catch (err) {
-    console.error("Error deleting task:", err.message);
-    res.status(500).json({ error: "Error deleting task" });
-  }
-});
-
-// Listen for client task updates
 module.exports = (io) => {
-  router.use((req, res, next) => {
-    req.io = io;
-    next();
-  });
-
-  io.on("connection", (socket) => {
-    console.log("A user connected:", socket.id);
-    socket.on("clientTaskUpdate", async () => {
-      try {
-        console.log("Received clientTaskUpdate from", socket.id); // Debug
-        await emitTaskUpdate(io); // Broadcast updated tasks
-      } catch (err) {
-        console.error("Error handling clientTaskUpdate:", err.message);
-      }
-    });
-    socket.on("disconnect", () => console.log("User disconnected:", socket.id));
-  });
-
+  router.io = io;
   return router;
 };
