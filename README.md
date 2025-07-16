@@ -1,4 +1,7 @@
 Task Board Application
+
+Demo Video: https://drive.google.com/file/d/1QdBcQ4e1LUymEaGgpREvHrZGIpsqIrIw/view?usp=drive_link
+
 This is a full-stack task board application with a Kanban-style interface, real-time updates, user authentication, and smart task assignment. The frontend is built with React, Vite, and custom CSS, deployed on Vercel. The backend uses Node.js, Express, MongoDB, and Socket.IO, deployed on Render.
 Features
 
